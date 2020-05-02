@@ -132,6 +132,44 @@ write_sf(f2, "street_trees_filtered180326.shp")
 
 #unique(f2$SPP[f2$taxa == "Acer"])
 
+### Table 1: street tree database in Detroit ######################################################
+library(readr)
+library(dplyr)
+library(forcats)
+st_trees <- read_csv("C:/Users/dsk856/Box/MIpostdoc/Detroit spatial data/Detroit Street Tree Inventory feb 2016/street_trees_with_coordinates_only.csv")
+# hist(st_trees$DBH)
+# names(st_trees)
+
+st_trees <- st_trees %>% 
+              mutate(genus = gsub( " .*$", "", SPP),
+                     group = genus,
+                     group = replace(x = group, SPP == "Acer platanoides", "Acer platanoides")) %>%
+              filter(genus != "vacant",
+                     genus != "stump") %>%
+              #case_when(SPP == "Acer platanoides" ~ group = "Acer platanoides") %>%
+              mutate(BA = (DBH ^2) * 0.005454154) #%>% #convert DBH in inches to BA in square ft
+              
+total_ba <- sum(st_trees$BA)
+table_1 <- st_trees %>% group_by(group) %>%
+              summarize(BA_sum = sum(BA),
+                        BA_rel = BA_sum / total_ba,
+                        n_trees = n()) %>%
+              mutate(group = replace(x = group, BA_rel < 0.002, "other")) %>%
+              mutate(group = replace(x = group, group == "unknown", "other")) %>%
+              mutate(group = replace(x = group, group == "Malus", "other")) %>% #looks like it was just on the cutoff point; 
+              #and wasn't included in the analysis. If I re-do the analysis drop the infrequent genera including:
+              #Ailanthus, Celtis, Ginkgo, Morus
+              group_by(group) %>%
+              summarize(BA_sum = sum(BA_sum),
+                        BA_rel = sum(BA_rel),
+                        n_trees = sum(n_trees)) 
+table_1 %>% summarize(BA_rel_total = sum(BA_rel), #totals for table
+                      n_trees_total = sum(n_trees))
+
+#what are the common species in a genus?
+st_trees %>% filter(genus == "Ginkgo") %>% group_by(SPP) %>% summarize(n = n())
+
+
 
 ## World View 2 image ==============================================================
 # Three WV2 images were acquired from Digital Globe via a data grant from 
@@ -140,7 +178,7 @@ write_sf(f2, "street_trees_filtered180326.shp")
 # DigitalGlobeImagery_v1 contains imagery at level 3D which IS orthorectified  
 # DigitalGlobeImagery_v2 contains imagery at level 2A which IS NOT orthorectified
 # Shannon was in charge of atmospheric correction; to do so he used Erdas Imagine
-
+# I manually made a cloud mask, it's here: "C:/Users/dsk856/Box/MIpostdoc/trees/tree_identificaiton/WV2_cloud_cover.shp"
 
 library(sf)
 library(raster)
@@ -151,6 +189,11 @@ library(randomForest)
 library(sp)
 library(stringr)
 
+#RMSE compared to LiDAR
+# lidar_wv2_rmse <- read.csv("C:/Users/dsk856/Box/MIpostdoc/trees/tree_identificaiton/imagery_rmse/rmse_lidar_wv2_200426.txt",
+#                            stringsAsFactors = FALSE, sep = '\t')
+# dist_1 <- pointDistance(cbind(lidar_wv2_rmse$X1, lidar_wv2_rmse$Y1), cbind(lidar_wv2_rmse$X2, lidar_wv2_rmse$Y2), lonlat=FALSE)
+# (sqrt(mean(dist_1^2))) #rmse
 
 # WV2 spectral index creation -----------------------------------------------------
 #originally from this script: wv2_derived_spectral_indices_creation190206.R
@@ -277,6 +320,12 @@ write.csv(dp_results2, "wv_spect_ind_190327.csv")
 # NearMap data was downloaded (Clark Library had a subscription)
 # data and original scripts are stored here:
 # C:\Users\dsk856\Box\MIpostdoc\Detroit spatial data\Nearmap
+# rmse for a nearmap image compared to the 2017 LiDAR (with 50 control points)
+# lidar_nearmap_rmse <- read.csv("C:/Users/dsk856/Box/MIpostdoc/trees/tree_identificaiton/imagery_rmse/rmse_lidar_nearmap181025.txt",
+#                            stringsAsFactors = FALSE, sep = '\t')
+# dist_1 <- pointDistance(cbind(lidar_nearmap_rmse$X1, lidar_nearmap_rmse$Y1), 
+#                         cbind(lidar_nearmap_rmse$X2, lidar_nearmap_rmse$Y2), lonlat=FALSE)
+# (sqrt(mean(dist_1^2))) #rmse: 1.04 m
 
 ## figuring out which tiles are in Detroit ------------------------------------------
 #the purpose of this script was to determine which Nearmap tiles are within Detroit
@@ -598,9 +647,909 @@ setwd("D:/tree_classification/segmentation/")
 st_write(tree_poly_points_chunks_unique, "tree_can_obj_190326_d.shp")
 
 ### assembling all predictor variables #############################################
+#Object based identification of trees in Detroit
+#setwd("//ITS-AD-DFS02.adsroot.itcs.umich.edu/MWS/dept/seas/Ibanez Lab/Dan Katz/POLLEN POSTDOC/Detroit spatial data/Nearmap")
+
+library(sf)
+library(raster)
+library(dplyr)
+#library(RStoolbox)
+library(randomForest)
+library(sp)
+
+rm(list = ls()) 
+#gc()
+
+### assemble object dataframe ################################################################
+#load in the middle WV2 swath for analysis
+setwd("E:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics")
+wm <- stack("mosaic11jun13164023mul_reflec.img")
+
+#load in canopy polygons 
+setwd("E:/tree_classification/segmentation/")
+t <- st_read("tree_can_obj_190326_d.shp") #polygons created from tree segmentation in R
+t2 <- st_crop(t, wm) #only select polygons within the datastack area
+t2 <- dplyr::filter(t2, area < 500 & area > 4)
+
+#load in the various derived variables
+#nearmap
+#created in: "nearmap_object_vars_190320.R"
+setwd("D:/aerial imagery/nearmap/derived_spectral_indices") #getwd()
+nearmap_spect <- read.csv("nearmap_spect_ind_190327.csv", stringsAsFactors = FALSE) #31678 * 2
+
+## wv2
+#created in: "wv2_derived_spectral_indices_creation.R"
+setwd("D:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics/derived_spectral_indices")
+wv2_spect <- read.csv("wv_spect_ind_190327.csv", stringsAsFactors = FALSE) #includes lots of NAs
+
+#created in "wv2_texture_indices_object.R"
+setwd("D:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics/derived_textural_indices")
+wv2_text <- read.csv("wv_text_ind_190329.csv", stringsAsFactors = FALSE)
+
+
+## lidar 2017
+setwd("D:/lidar/2017 LiDAR")
+lid17 <- read.csv("lid17_ind_190412.csv") #indices for raw lidar, intensity, nSDM - DTM
+lid17$X <- NULL
+lid17_tex <- read.csv("lid17_tex_190415.csv") #lidar texture
+lid17_tex$X <- NULL
+names(lid17_tex) <- sub("wp_", "lid17_", names(lid17_tex)) #quick fix for column names that weren't renamed correctly in texture script
+#lid17_inten <- read.csv("") #lidar intensity
+lid17_tex_inten <- read.csv("lid17_tex_inten_190412.csv") #lidar intensity texture
+lid17_tex_inten$X <- NULL
+names(lid17_tex_inten) <- sub("wp_", "lid17_inten_", names(lid17_tex_inten)) #quick fix for column names that weren't renamed correctly in texture script
+
+#misail
+#naip
+
+## join the variables into one large df
+t3 <- left_join(t2, wv2_spect)
+t3 <- left_join(t3, wv2_text)
+t3 <- left_join(t3, nearmap_spect)
+t3 <- left_join(t3, lid17)
+t3 <- left_join(t3, lid17_tex)
+t3 <- left_join(t3, lid17_tex_inten)
+
+## load in variables based on the independent variable csvs that were created for the predictions -----------
+#work around for re-doing a section of the analysis
+library(readr)
+library(purrr)
+
+setwd("E:/tree_classification/predictions/csv_for_pred_vars")
+csvs_for_pred <- dir()#[1:3]
+
+compile_csvs <- function(file_name){
+  read_csv(file_name, col_types = cols(Id = col_character(), grdcd = col_character())) %>%
+  select(-c("X1", "grond", "tree", "build", "NA_px", "X", "nSDM_2017_", "nSDM_201_1", "nSDM_201_2", "ply__"))
+}
+
+all_csvs <- map_dfc(csvs_for_pred, compile_csvs) #this is a little messy since the Id and grdcd columns are duplicated.
+# double check that all of the grdcd columns are the same (no offsets)
+# select(all_csvs, contains("grdcd")) %>% sample_n(10000) %>% t(.) %>% as.data.frame %>% distinct() 
+# this check works by making sure that there aren't differences in a sample of the grdcd values
+
+#remove the duplicate grdcd and Id columns
+cols_to_remove_grdcd <- names(all_csvs) %>% grep(pattern = "grdcd", x = ., value = TRUE)
+cols_to_remove_grdcd <- cols_to_remove_grdcd[2:length(cols_to_remove_grdcd)]
+cols_to_remove_Id <- names(all_csvs) %>% grep(pattern = "Id", x = ., value = TRUE)
+cols_to_remove_Id <- cols_to_remove_Id[2:length(cols_to_remove_Id)]
+cols_to_remove <- c(cols_to_remove_grdcd, cols_to_remove_Id)
+all_csvs2 <- all_csvs %>% select(-cols_to_remove) %>%
+            mutate(grdcd = as.numeric(grdcd),
+                   Id = as.numeric(Id))
+
+# join the independent variables with the analysis dataset
+t3 <- left_join(t2, all_csvs2)
+#write_csv(t3, "C:/Users/dsk856/Box/MIpostdoc/trees/tree_identificaiton/polygons_with_imagery_for_analysis.csv")
+
+#remove the polygons that are under the cloud mask
+clouds <- read_sf("C:/Users/dsk856/Box/MIpostdoc/trees/tree_identificaiton/WV2_cloud_cover.shp") 
+clouds <- st_transform(clouds, crs(t3)) #the crs *seems* to be exactly the same between them, but somewhere it isn't
+cloud2 <- clouds %>% mutate(cloud = "cloud") %>% select(cloud)
+
+t3_cloud <- st_join(t3, cloud2)
+t3_cloud <- filter(t3_cloud, is.na(cloud)) %>%
+              select(-cloud)
+
+library(forcats)
+t3_nogeo <- t3_cloud
+st_geometry(t3_nogeo) <- NULL #speeds up processing
+t3_nogeo <- t3_nogeo %>% mutate(taxa = fct_recode(taxa, conifer = "Picea", conifer = "Pinus")) %>%
+            mutate(taxa2 = fct_lump_min(taxa, min = 100, other_level = "other")) #only including taxa that have more than 100 polygons in focal area
+            
+# count_taxa <- t3_nogeo %>% group_by(taxa2) %>% summarize(count_taxa = n())  #number of polygons from each taxon
+# print(count_taxa, n = nrow(count_taxa))
+#t3 <- left_join(t3, count_taxa, by = "taxa")
+#t4 <- dplyr::filter(t3, count_taxa > 100) #only including taxa that have more than 100 polygons in focal area
+
+#t3$taxa2 <- t3$taxa
+#t3$taxa2[t3$count_taxa < 100] <- "other"
+
+#str(t3$taxa2)
+t4 <- t3
+#t5 <- sample_n(t4, 10000)
 
 ### classification #################################################################
+set.seed(100)
+dp <- t4
+dp$geometry <- NULL
+dp$count_taxa <- NULL
+dp2 <- dp[!is.na(dp$nearmap_181025_gei_d_sd),]
+
+#names(which(sapply(dp2, anyNA)))
+sapply(dp2, function(y) sum(length(which(is.na(y))))) #count number of NAs in each column
+
+dp2 <- dp2 %>% replace(., is.na(.), 0)
+### TRY THIS OUT
+#try missing forest algorithm in order to impute missing values
+
+#dp2 <- dp2[Reduce('&', lapply(dp2, is.finite)),] #remove any NAs/ INF values
+
+dp2$taxa <- as.character(dp2$taxa)
+# dp2$taxa[dp2$taxa == "Aesculus" | dp2$taxa == "Ailanthus" |dp2$taxa == "Catalpa"| 
+#            dp2$taxa == "Pyrus"] <- "other"
+
+#making a completely balanced dataset
+# dp3 <- dp2
+# #dp3$taxa <- as.character(dp3$taxa)
+# dp3$taxa <- as.factor(as.character(dp3$taxa)) 
+# group_by(dp3, taxa) %>% summarize(count = n())
+
+
+# # #original single taxon version
+# group_by(dp2, taxa) %>% summarize(count = n())
+# focal_taxon <- "Quercus"
+#dp3 <- dp2
+#dp3$taxa <- as.character(dp3$taxa)
+# dp3$taxa[dp3$taxa != focal_taxon] <- "other"
+# dp3$taxa <- as.factor(as.character(dp3$taxa))
+#dp3 <- group_by(dp3, taxa) %>% sample_n(n_focal)
+#dp3$taxa <- as.factor(as.character(dp3$taxa))
+dp3 <- dp2
+dp3$train0_test1 <- rbinom(n = nrow(dp3) , size = 1, prob = 0.3) #?rbinom
+dp3_for_modeling <- dp3[, c(34:374)] #names(dp3)
+names(dp3_for_modeling)
+dp3_for_modeling$taxa <- as.factor(as.character(dp3_for_modeling$taxa2)) ##TrainSet2 <- cbind(TrainSet2, TrainSet$taxa)
+dp3_for_modeling$taxa2 <- NULL
+names(dp3_for_modeling)
+
+#TrainSet2 <- TrainSet[, c(34:374)] #MAKE SURE ITS ONLY REMOTE SENSING VARS LEFT HERE
+
+TrainSet <- filter(dp3_for_modeling,  train0_test1== 0)
+TrainSet %>% group_by(taxa) %>% summarize(n_taxa = n())
+
+ValidSet <- filter(dp3_for_modeling, train0_test1 == 1)
+ValidSet %>% group_by(taxa) %>% summarize(n_taxa = n())
+
+
+
+
+#n_focal <- filter(TrainSet, taxa == focal_taxon) %>% NROW()
+#TrainSet %>% group_by(taxa) %>% summarize(n_taxa = n())
+#TrainSet <- group_by(TrainSet, taxa) %>% sample_n(n_focal)
+
+#ValidSet %>% group_by(taxa) %>% summarize(n_taxa = n())
+#ValidSet <- group_by(ValidSet, taxa) %>% sample_n(200, replace = TRUE)
+
+#train <- sample(nrow(dp3), 0.7*nrow(dp3), replace = FALSE)
+#TrainSet <- dp3[train,] #length(unique(TrainSet$taxa)) #levels(TrainSet$taxa)
+#TrainSet %>% group_by(taxa) %>% summarize(n_taxa = n())
+#ValidSet <- dp3[-train,] #length(unique(ValidSet$taxa))
+
+#  TrainSet <- group_by(TrainSet, taxa) %>% sample_n(800, replace = TRUE)
+
+
+
+
+# Split into Train and Validation sets
+# Training Set : Validation Set = 70 : 30 (random)
+# set.seed(100)
+# train <- sample(nrow(dp3), 0.7*nrow(dp3), replace = FALSE)
+# TrainSet <- dp3[train,] #length(unique(TrainSet$taxa)) #levels(TrainSet$taxa)
+
+#ValidSet <- dp3[-train,] #length(unique(ValidSet$taxa))
+
+#TrainSet[is.infinite(TrainSet)]
+
+#str(TrainSet)
+#names(TrainSet)
+#TrainSet <- dp2[train,] #length(unique(TrainSet$taxa)) #levels(TrainSet$taxa)
+# TrainSet2 <- TrainSet[, c(34:374)] #MAKE SURE ITS ONLY REMOTE SENSING VARS LEFT HERE
+#TrainSet2 <- dplyr::select(TrainSet, contains("nearmap_"))
+
+# TrainSet2$taxa <- as.factor(as.character(TrainSet$taxa2)) ##TrainSet2 <- cbind(TrainSet2, TrainSet$taxa)
+# TrainSet2$taxa2 <- NULL
+# names(TrainSet2)
+
+#adding in Boruta to select only the useful variables: spoiler- all variables were listed as important
+# library("Boruta")
+# boruta_train <- Boruta(taxa~., data = TrainSet, doTrace = 2) #takes 5 hours
+# print(boruta_train)
+# attributes_to_include <- getSelectedAttributes(boruta_train)
+# plot(boruta_train)
+# boruta_df <- attStats(boruta_train)
+# setwd("//ITS-AD-DFS02.adsroot.itcs.umich.edu/MWS/dept/seas/Ibanez Lab/Dan Katz/POLLEN POSTDOC/trees/tree_identificaiton")
+# write.csv(boruta_df, "boruta_df_190418.csv") #getwd()
+# print(bank_df)
+# plotImpHistory(boruta_train)
+
+start_time <- Sys.time() #takes about an hour 
+#TrainSet2 <- TrainSet2[,c(1:318,340:341)]#names(TrainSet2) #not including certain variable classifications in model
+model1 <- randomForest(taxa ~ ., data = TrainSet, importance = TRUE)
+model1
+print(Sys.time() - start_time)
+#plot(model1)
+
+# model2 <- randomForest(taxa ~ ., data = TrainSet, ntree = 500, mtry = 6, importance = TRUE)
+# model2
+
+# Predicting on train set
+#predTrain <- predict(model1, TrainSet, type = "class")
+#str(predTrain)
+# Checking classification accuracy
+#table(predTrain, TrainSet$taxa)  
+
+
 
 ### model assessment ###############################################################
+# Predicting on Validation set
+#ValidSet$taxa2 <- as.character(ValidSet$taxa) #ValidSet$taxa <- NULL #ValidSet$taxa <- ValidSet$taxa2
+predValid <- predict(model1, ValidSet, type = "class")
+#?predict
+# Checking classification accuracy
+#mean(predValid == ValidSet$taxa)                    
+# test <- (as.matrix(table(predValid,ValidSet$taxa)))
+# test
+
+mean(predValid == ValidSet$taxa) 
+confusion_df <- as.data.frame.matrix(table(predValid,ValidSet$taxa)) #rows = predicted, col = actual
+confusion_df$row_sum <- rowSums(confusion_df)
+confusion_df[ (nrow(confusion_df) +1) ,] <- colSums(confusion_df)
+#View(confusion_df)
+
+model_importance_df <- as.data.frame(importance(model1))        
+View(model_importance_df) #names(model_importance_df)
+varImpPlot(model1) 
+#hist(model_importance_df$MeanDecreaseGini)
+#str(model_importance_df)
+
+save(model1, file = "d_rf190424.RData")
+
+
+
+### check the contributions of each dataset ###################################################
+setwd("//ITS-AD-DFS02.adsroot.itcs.umich.edu/MWS/dept/seas/Ibanez Lab/Dan Katz/POLLEN POSTDOC/trees/tree_identificaiton/dataset_selection")
+
+#list of all datasets to do separately
+names(TrainSet)
+names_wv2 <- names(TrainSet)[c(1:72, 341)]
+names_wv2_raw <- names(TrainSet)[c(28:51, 341)]
+names_wv2_indices <- names(TrainSet)[c(1:27, 341)]
+names_wv2_tex <- names(TrainSet)[c(52:72, 341)]
+names_nearmap <- names(TrainSet)[c(73:288, 341)]
+names_lidar <- names(TrainSet)[c(289:339, 341)]
+names_lidar_int <- names(TrainSet)[c(292:294, 341)]
+names_lidar_tex <- names(TrainSet)[c(298:318, 341)]
+names_lidar_int_tex <- names(TrainSet)[c(319:339, 341)]
+names_lidar_nearmap <- names(TrainSet)[c(73:339, 341)]
+names_lidar_wv2 <- names(TrainSet)[c(1:72, 289:339, 341)]
+names_all <- names(TrainSet)[c(1:339, 341)]
+names_all_no_tex <- names(TrainSet)[c(1:51, 73:297, 341)]
+
+list_models <- list("names_wv2" = names_wv2, 
+                    "names_wv2_raw" = names_wv2_raw, 
+                    "names_wv2_indices" = names_wv2_indices,
+                    "names_wv2_tex" = names_wv2_tex,
+                    "names_nearmap" = names_nearmap,
+                    "names_lidar" = names_lidar,
+                    "names_lidar_int" = names_lidar_int,
+                    "names_lidar_tex" = names_lidar_tex,
+                    "names_lidar_int_tex" = names_lidar_int_tex,
+                    "names_lidar_nearmap" = names_lidar_nearmap,
+                    "names_lidar_wv2" = names_lidar_wv2,
+                    "names_all" = names_all,
+                    "names_all_no_tex" = names_all_no_tex 
+)
+
+for(i in 13:13){#start loop#for(i in 1:12){#start loop
+  start_time <- Sys.time() #takes about an hour 
+  focal_model <- list_models[i]
+  focal_model_name <- names(focal_model)
+  print(focal_model_name)
+  
+  focal_model_data <- dplyr::select(TrainSet, unlist(focal_model))
+  names(focal_model_data) <- unlist(focal_model) #names_wv2 #fixing the naming issue by going back to the original
+  #names(focal_model_data)
+  
+  #run model
+  model1 <- randomForest(taxa ~ ., data = focal_model_data, importance = TRUE)
+  predValid <- predict(model1, ValidSet, type = "class")
+  print(mean(predValid == ValidSet$taxa))
+  
+  #confusion matrix
+  confusion_df <- as.data.frame.matrix(table(predValid,ValidSet$taxa)) #rows = predicted, col = actual
+  confusion_df$row_sum <- rowSums(confusion_df) #View(confusion_df)
+  confusion_df[ (nrow(confusion_df) +1) ,] <- colSums(confusion_df)
+  confusion_df_file_name <- paste0("confus_df_", focal_model_name, ".csv")
+  write.csv(confusion_df, file = confusion_df_file_name, row.names = TRUE) #?write.csv
+  
+  #model importance df
+  model_importance_df <- as.data.frame(randomForest::importance(model1))   #View(model_importance_df) 
+  confusion_df_file_name <- paste0("model_import_", focal_model_name, ".csv")
+  write.csv(model_importance_df, confusion_df_file_name)
+  print(Sys.time() - start_time)
+}#end loop
+
+## create a table from the results ===============================
+library("psych")
+setwd("//ITS-AD-DFS02.adsroot.itcs.umich.edu/MWS/dept/seas/Ibanez Lab/Dan Katz/POLLEN POSTDOC/trees/tree_identificaiton/dataset_selection")
+confus_file_list <- dir()[grep("confus_df", dir())]
+n_models <- length(confus_file_list)
+
+#create dataframe to hold results
+
+models_results <- data.frame(model_name = rep(NA, n_models), 
+                             model_accuracy = rep(NA, n_models),
+                             model_user_acc = rep(NA, n_models),
+                             model_prod_acc = rep(NA, n_models),
+                             kappa_stat = rep(NA, n_models))
+
+#loop through all files
+for(i in 1:length(confus_file_list)){
+  #i <- 1
+  #load confusion matrix
+  confusion_df <- read.csv(confus_file_list[i])
+  confusion_df_small <- confusion_df[1:(nrow(confusion_df ) - 1), 1:(ncol(confusion_df) - 1)]
+  confusion_df_small$X <- NULL
+  confusion_df_small <- as.matrix(confusion_df_small)
+  
+  #model_name
+  models_results$model_name[i] <- sub("confus_df_names_", "", confus_file_list[i])
+  models_results$model_name[i] <- sub(".csv", "", models_results$model_name[i])
+  
+  #total accuracy
+  models_results$model_accuracy[i] <- sum(diag(confusion_df_small))/sum(confusion_df_small)
+  
+  #users accuracy
+  #diag(confusion_df_small) / rowSums(confusion_df_small)
+  model_user_acc <- mean( diag(confusion_df_small) / rowSums(confusion_df_small), na.rm = TRUE)
+  models_results$model_user_acc[i] <- model_user_acc
+  
+  #producers accuracy
+  #diag(confusion_df_small) / colSums(confusion_df_small)
+  model_prod_acc <- mean( diag(confusion_df_small) / colSums(confusion_df_small), na.rm = TRUE)
+  models_results$model_prod_acc[i] <- model_prod_acc
+  
+  #kappa
+  kappa_stat <- cohen.kappa(confusion_df_small) #use the estimate for unweighted kappa
+  models_results$kappa_stat[i] <- kappa_stat$kappa 
+  
+}
+
+#save model diagnostic table
+models_results
+library(stargazer)
+stargazer(models_results, type = "html", summary = FALSE, rownames = FALSE, out = "summary_table.doc")
+
+#save confusion matrix table for all 
+confus_matrix_all <- read.csv("confus_df_names_all.csv")
+stargazer(confus_matrix_all, type = "html", summary = FALSE, rownames = FALSE, out = "confusion_matrix_table.doc")
+
+#save importance values table
+importance_vals_all <- read.csv("model_import_names_all_no_tex.csv")
+importance_vals_all <- arrange(importance_vals_all, by = -MeanDecreaseAccuracy)
+importance_vals_all <- rename(importance_vals_all, "variable" = "X")
+importance_vals_all_trunc <- importance_vals_all[1:50, ]
+stargazer(importance_vals_all_trunc, type = "html", summary = FALSE, rownames = FALSE, out = "SI_variable_importance_table.doc")
 
 ### prediction #####################################################################
+#predict tree identity across all of Detroit 
+#the model this is based on was run in "tree_classification_obj_D_190419.R"
+# this was originally in the script: "tree_classification_predictions_D190807.R"
+
+#set up work environment
+library(sf)
+library(raster)
+library(tidyr)
+library(dplyr)
+library(velox)
+library(stringr)
+rm(list = ls()) 
+
+
+## assemble dataset for predictions ============================================
+# load in ALL objects from segmentation 
+#load in a chunk of segmentation for Detroit: created in "tree_segmentation190326.R"
+setwd("D:/tree_classification/segmentation/nSDM2017_UTM17_seg_rast_chunks/rast_to_polygons")
+#dir()
+all_files_subfiles <- dir() #all files, including subfiles
+all_files <- all_files_subfiles[str_sub(all_files_subfiles, -4, -1) == ".shp"] 
+
+# lidar 
+setwd("D:/lidar/2017 LiDAR")
+lid17 <- raster("nSDM_2017_UTM17.tif") #lid17 <- NULL
+tbg <- raster("trees_ground_build_v2_UTM17_v2_within_D.tif")
+
+# load WV2 imagery (will clip trees to middle swath) 
+setwd("D:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics")
+wm <- stack("mosaic11jun13164023mul_reflec.img") # wm <- NULL
+
+
+# load in tree canopy objects (that are considered street trees) 
+setwd("D:/tree_classification/segmentation/")
+t <- st_read("tree_can_obj_190326_d.shp") #polygons created from tree segmentation in R
+
+## start loop to go through all of the objects in chunks 
+
+## extract lidar nSDM for all objects in that chunk of the shapefile ==========================
+setwd("D:/tree_classification/segmentation/nSDM2017_UTM17_seg_rast_chunks/rast_to_polygons")
+for(j in 1:1){ #probly less than 12 hours to run for all chunks
+  start_time <- Sys.time()
+  
+  seg <- st_read(all_files[j])
+  #names(seg)
+  #seg[1,1]
+  
+  # seg2 <- st_crop(seg, wm) #only select polygons within the datastack area
+  # t2 <- dplyr::filter(t2, area < 500 & area > 4)
+  
+  ### extracting values from existing rasters of spectral indices###
+  #derived indices
+  lid_rast <- lid17  #plug in each of the lidar rasters here #wv_rast <- stack(wv_list[1])
+  lid_rast <- crop(lid17, wm)
+  lid_rast_vx <- velox(lid_rast) #takes a couple min to run, maybe 6 GB memory
+  lid_rast_names <- names(lid_rast)
+  
+  #extract lidar data for each object
+  for(i in 1:nrow(seg)){ #loop through all of the objects#nrow(seg)){ #loop through all of the objects
+    seg_small <- seg[i,]
+    obj_data_vx <- lid_rast_vx$copy() #extent(obj_data_vx)
+    obj_data_vx$crop(seg_small) #extent(obj)
+    
+    bands_d_mean <- obj_data_vx$extract(sp = seg_small, fun=mean)
+    bands_d_mean_df <- as.data.frame(bands_d_mean)
+    names(bands_d_mean_df) <- paste0(lid_rast_names, "_d_mn")
+    bands_d_sd <- obj_data_vx$extract(seg_small, fun=sd)
+    bands_d_sd_df <- as.data.frame(bands_d_sd)
+    names(bands_d_sd_df) <- paste0(lid_rast_names, "_d_sd")
+    bands_d_median <- obj_data_vx$extract(seg_small, fun=median)
+    bands_d_median_df <- as.data.frame(bands_d_median)
+    names(bands_d_median_df) <- paste0(lid_rast_names, "_d_md")
+    dp_focal_poly <- cbind(bands_d_sd_df, bands_d_mean_df, bands_d_median_df)
+    if( i == 1){dp <- dp_focal_poly}
+    if( i > 1){dp <- bind_rows(dp, dp_focal_poly)}
+  } #end band extraction loop #40 min for 158000 obs.  
+  
+  #save results from object chunk
+  # if(j == 1){dp_results <- bind_cols(seg, dp)}
+  # if(j > 1){
+  dp_results_chunkj <- bind_cols(seg, dp)
+  #dp_results <- bind_rows(dp_results, dp_results_chunkj) 
+  #}
+  
+  #save results
+  object_chunk_lidar_filename <- paste0("object_lidar_data_chunk_",j,".csv")
+  dp_results_save <- dp_results_chunkj
+  dp_results_save$geometry <- NULL
+  write.csv(dp_results_save, object_chunk_lidar_filename)
+  print(Sys.time() - start_time)
+} # end object chunk loop
+
+
+
+# extract whether each object is classified as tree, building, ground 
+#for all objects in that chunk of the shapefile 
+
+setwd("D:/tree_classification/segmentation/nSDM2017_UTM17_seg_rast_chunks/rast_to_polygons")
+for(j in 1:9){ #~5 hours to run for all chunks
+  start_time <- Sys.time()
+  
+  seg <- st_read(all_files[j]) #seg <- st_read(all_files[5])
+  #names(seg)
+  #seg[1,1]
+  
+  # seg2 <- st_crop(seg, wm) #only select polygons within the datastack area
+  # t2 <- dplyr::filter(t2, area < 500 & area > 4)
+  
+  ### extracting values from existing rasters of spectral indices###
+  #derived indices
+  tbg_rast <- tbg  #plug in each of the tbg rasters here #wv_rast <- stack(wv_list[1])
+  tbg_rast <- crop(tbg, wm)
+  tbg_rast_vx <- velox(tbg_rast) #takes a couple min to run, maybe 6 GB memory
+  tbg_rast_names <- names(tbg_rast)
+  
+  #extract tbg data for each object
+  for(i in 1:nrow(seg)){ #loop through all of the objects#nrow(seg)){ #loop through all of the objects
+    seg_small <- seg[i,] #seg_small <- seg[13987, ] #413829
+    obj_data_vx <- tbg_rast_vx$copy() #extent(obj_data_vx)
+    obj_data_vx$crop(seg_small) #extent(seg_small) #plot(seg_small)
+    #plot(tbg_rast, xlim =c(327249, 327400), ylim =c(4700800, 4700930))
+    #plot(seg_small, add = TRUE)
+    
+    tbg_vals <- obj_data_vx$extract(sp = seg_small, fun= NULL)
+    tbg_vals_unlist <- unlist(tbg_vals)
+    
+    NA_pixels <- as.data.frame(0)
+    if(length(na.omit(tbg_vals_unlist)) == 0){
+      NA_pixels <- as.data.frame(length(is.na(tbg_vals_unlist)))
+    }
+    names(NA_pixels) <- "NA_pixels"
+    ground_pixels <- as.data.frame(length(tbg_vals_unlist[tbg_vals_unlist == 1]))
+    names(ground_pixels) <- "ground"
+    tree_pixels <- as.data.frame(length(tbg_vals_unlist[tbg_vals_unlist == 2]))
+    names(tree_pixels) <- "tree"
+    build_pixels <- as.data.frame(length(tbg_vals_unlist[tbg_vals_unlist == 3]))
+    names(build_pixels) <- "build"
+    dp_focal_poly <- cbind(ground_pixels, tree_pixels, build_pixels, NA_pixels)
+    if( i == 1){dp <- dp_focal_poly}
+    if( i > 1){dp <- bind_rows(dp, dp_focal_poly)}
+  } #end band extraction loop #40 min for 158000 obs.  
+  
+  #save results from object chunk
+  # if(j == 1){dp_results <- bind_cols(seg, dp)}
+  # if(j > 1){
+  dp_results_chunkj <- bind_cols(seg, dp)
+  #dp_results <- bind_rows(dp_results, dp_results_chunkj) 
+  #}
+  
+  #save results
+  object_chunk_tbg_filename <- paste0("object_tbg_data_chunk_",j,".csv")
+  dp_results_save <- dp_results_chunkj
+  dp_results_save$geometry <- NULL
+  write.csv(dp_results_save, object_chunk_tbg_filename)
+  print(Sys.time() - start_time)
+} # end object chunk loop
+
+# # #load in a completed chunk and check it out manually in arcgis
+# seg <- st_read(all_files[5])
+# test <- read.csv("object_tbg_data_chunk_5.csv")
+# test2 <- left_join(seg, test)
+# test2$tree2 <- 0
+# test2$tree2[test2$tree > test2$build & 
+#               test2$tree > test2$ground & 
+#               test2$tree > test2$NA_pixels ] <- "1"
+# write_sf(test2, "test6.shp")
+
+
+
+### load all of the processed csv chunks, combine, and filter for height and tree ################
+setwd("D:/tree_classification/segmentation/nSDM2017_UTM17_seg_rast_chunks/rast_to_polygons")
+#dir()
+all_files_subfiles <- dir() #all files, including subfiles
+all_files <- all_files_subfiles[str_sub(all_files_subfiles, -4, -1) == ".csv"] 
+tbg_files <- all_files[grep("tbg", all_files)]
+lidar_files <- all_files[grep("lidar", all_files)]
+seg_files <- all_files_subfiles[str_sub(all_files_subfiles, -4, -1) == ".shp"] 
+
+all_t_seg <- NULL
+for(i in 1:9){
+  tbg_chunk <- read.csv(tbg_files[i]) #names(test)
+  tbg_chunk$X <- NULL
+  lidar_chunk <- read.csv(lidar_files[i])
+  tbglid_chunk <- left_join(tbg_chunk, lidar_chunk,  by = c("Id", "gridcode"))
+  tbglid_chunk_f <- filter(tbglid_chunk, tree > build & 
+                             tree > ground &
+                             tree > NA_pixels)
+  tbglid_chunk_f <- filter(tbglid_chunk_f, nSDM_2017_UTM17_d_md > 15 & nSDM_2017_UTM17_d_md < 150)
+  
+  if(nrow(tbglid_chunk_f) > 1){ #protect against the chunks that don't overlap with this wv2 area
+    tbglid_chunk_f$poly_is_tree <- "tree"
+    seg_chunk <- st_read(seg_files[i])
+    seg_chunk_rast <- left_join(seg_chunk, tbglid_chunk_f)
+    seg_chunk_rast_f <- filter(seg_chunk_rast, poly_is_tree == "tree")
+    
+    if(exists("all_t_seg") == FALSE){all_t_seg <- seg_chunk_rast_f}
+    if(exists("all_t_seg") == TRUE){all_t_seg <- rbind(all_t_seg, seg_chunk_rast_f)}
+  }
+} #hist(all_t_seg$nSDM_2017_UTM17_d_md, breaks = 100)
+setwd("D:/tree_classification/segmentation")
+write_sf(all_t_seg, "all_tree_polygons_inD190508.shp") #save results
+
+
+
+
+
+# load in rasters for all predictor vars 
+#clear out workspace
+rm(list = ls()) 
+gc() #velox is pretty memory hungry, need to manually clear space for it
+setwd("D:/tree_classification/predictions/csv_for_pred_vars")
+
+wm <- stack("D:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics/mosaic11jun13164023mul_reflec.img") # wm <- NULL
+all_t_seg <- st_read("D:/tree_classification/segmentation/all_tree_polygons_inD190508.shp") 
+
+#load in the required files 
+# lidar
+lid_list <- c("D:/lidar/2017 LiDAR/nSDM_2017_UTM17.tif",
+              "D:/lidar/2017 LiDAR/lidar2017_intensity_utm.tif",
+              "D:/lidar/2017 LiDAR/SDM_DTM_2017_UTM17.tif")
+
+# wv2 
+wv2_list <- dir("D:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics/derived_spectral_indices",
+                full.names = TRUE)
+wv2_list <- wv2_list[str_sub(wv2_list, -4, -1) == ".tif"] 
+wv2_list_raw <- dir("D:/satellite imagery/DigitalGlobe_2011_2012/DigitalGlobe_mosaics/raw_bands", 
+                    full.names = TRUE)
+wv2_list_raw <- wv2_list_raw[str_sub(wv2_list_raw, -4, -1) == ".tif"] 
+wv2_list_full <- c(wv2_list, wv2_list_raw)
+
+# nearmap 
+near_list <- dir("D:/aerial imagery/nearmap/derived_spectral_indices",
+                 full.names = TRUE)
+near_list <- near_list[str_sub(near_list, -4, -1) == ".tif"] 
+#remove hsv rasters (they're just the first raster from the stack of 3)
+near_list_nohsv <- near_list[grep(pattern = "hsv", x = near_list, invert = TRUE)]
+
+#add hsv individual rasters
+near_hsv_list <- dir("D:/aerial imagery/nearmap/derived_spectral_indices/nearmap_hsv/", 
+                     full.names = TRUE)
+near_list_full <- c(near_list_nohsv, near_hsv_list)
+
+#all rasters #note that some are as bands within a raster stack #nearmap hsv
+all_rasters <- c(lid_list, wv2_list_full, near_list_full)
+#grep(vars_to_extract_median,all_rasters)
+#all_rasters_md <- all_rasters[2]
+# 
+
+#THIS IS IN A SECTION BELOW, NEED TO RUN IT FIRST
+vars_to_extract_median2 <- str_sub(vars_to_extract_median, 1, -8)
+# grep(c("gei","grvi"), all_rasters)
+
+#double checking that all rasters were extracted
+existing_files <- dir("D:/tree_classification/predictions/csv_for_pred_vars/")
+existing_files <- sub("poly_", "", existing_files)
+existing_files <- sub(".csv", "", existing_files)
+vars_to_extract_median2 <- vars_to_extract_median2[!vars_to_extract_median2 %in% existing_files]
+
+
+#getting all rasters that were messed up in SJBs extraction and pairing that with the vector
+all_rasters2 <- unique (grep(paste(vars_to_extract_median2,collapse="|"), all_rasters, value=TRUE))
+all_rasters <- all_rasters2
+
+
+
+### extracting values from existing rasters of spectral indices###
+total_start_time <- Sys.time()
+for(r in 1:length(all_rasters)){#  1){    #length(all_rasters)){ #  # #start raster loop
+  start_time <- Sys.time()
+  
+  focal_rast <- raster(all_rasters[r]) #r <- 1
+  focal_rast <- crop(focal_rast, wm)
+  focal_rast_vx <- velox(focal_rast) #focal_rast_vx <- NULL #gc()
+  focal_rast_names <- names(focal_rast)
+  
+  
+  
+  #for(i in 1:1000){#
+  for(i in 1:nrow(all_t_seg)){ #loop through all of the objects #for(i in 1:1000){ #
+    poly_to_extract_small <- all_t_seg[i,]
+    obj_data_vx <- focal_rast_vx$copy() #extent(obj_data_vx)
+    obj_data_vx$crop(poly_to_extract_small) #extent(obj)
+    
+    bands_d_mean <- obj_data_vx$extract(sp = poly_to_extract_small, fun=mean)
+    bands_d_mean_df <- as.data.frame(bands_d_mean)
+    names(bands_d_mean_df) <- paste0(focal_rast_names, "_d_mn")
+    bands_d_sd <- obj_data_vx$extract(poly_to_extract_small, fun=sd)
+    bands_d_sd_df <- as.data.frame(bands_d_sd)
+    names(bands_d_sd_df) <- paste0(focal_rast_names, "_d_sd")
+    bands_d_median <- obj_data_vx$extract(poly_to_extract_small, fun=median)
+    bands_d_median_df <- as.data.frame(bands_d_median)
+    names(bands_d_median_df) <- paste0(focal_rast_names, "_d_md")
+    dp_focal_poly <- cbind(bands_d_sd_df, bands_d_mean_df, bands_d_median_df)
+    if( i == 1){dp <- dp_focal_poly}
+    if( i > 1){dp <- bind_rows(dp, dp_focal_poly)}
+  } #end band extraction loop
+  
+  #dp_results <- bind_cols(all_t_seg[1:1000, ], dp) 
+  dp_results <- bind_cols(all_t_seg[, ], dp) 
+  dp_results$geometry <- NULL
+  csv_save_name <- paste0("D:/tree_classification/predictions/csv_for_pred_vars/","poly_",focal_rast_names,".csv")
+  write.csv(dp_results, csv_save_name)
+  
+  #for memory usage
+  focal_rast_vx <- NULL #
+  gc()
+  print(paste("finished:", focal_rast_names))
+  print(Sys.time() - start_time)
+}#end raster loop
+
+Sys.time() - total_start_time 
+
+
+
+###extract data from csvs and make a large df for RF #######################################
+setwd("D:/tree_classification/predictions/csv_for_pred_vars")
+csvs_for_pred <- dir()
+#test <- read.csv(csvs_for_pred[1], nrows = 1000)
+myfiles = do.call(cbind, lapply(csvs_for_pred, 
+                                function(x) read.csv(x, stringsAsFactors = FALSE, nrows = 1000)))
+
+myfiles2 <- myfiles[, !duplicated(colnames(myfiles), fromLast = TRUE)] 
+#rename the hsv bands to match t4 ("_" vs ".")
+names(myfiles2) <- gsub(pattern = "hsv_", replacement = "hsv.", x = names(myfiles2))
+
+#compare names against dataframe from predictions DF
+#LOAD IN t4 from the tree_class_obj_D_190419.R, takes about a min
+#names(t4) # nearmap_181025_hsv.3_d_mn
+#names(myfiles2) #nearmap_181025_hsv_d_mn
+names(myfiles2)[names(myfiles2) %in% names(t4) == FALSE]
+names(t4)[names(t4) %in% names(myfiles2) == FALSE]
+
+
+
+
+
+## predict object identity using pre-run RF model ============================================
+library(randomForest)
+all_t_seg <- st_read("D:/tree_classification/segmentation/all_tree_polygons_inD190508.shp")
+
+#load rf model
+load("//ITS-AD-DFS02.adsroot.itcs.umich.edu/MWS/dept/seas/Ibanez Lab/Dan Katz/POLLEN POSTDOC/trees/tree_identificaiton/d_rf190424.RData")
+print(model1)
+
+#load in extracted data that was extracted by SJB on ~6/5/19
+library(readr)
+zonal_means <- read_csv("E:/tree_classification/predictions/sjb_rast_extraction/katz_zonal_mean.txt") #, n_max = 100000
+zonal_medians <- read_csv("E:/tree_classification/predictions/sjb_rast_extraction/katz_zonal_median.txt") 
+zonal_sd <- read_csv("E:/tree_classification/predictions/sjb_rast_extraction/katz_zonal_std.txt")
+
+names(zonal_means) <-  c(names(zonal_means[1:15]), paste0(names(zonal_means[16:115]), "_mn")) #head(zonal_means)
+names(zonal_medians) <- c(names(zonal_medians[1:5]), paste0(names(zonal_medians[6:105]), "_md"))
+
+#names of columns that SJB didn't get effectively
+test <- apply( zonal_medians, 2 , quantile , probs = c(0.25, 0.75) , na.rm = TRUE )
+test2 <- as.data.frame(t(test))
+test2$var <- row.names(test2)
+names(test2) <- c("p25", "p75", "var")
+test3 <- filter(test2, abs(p25) < 10)
+vars_to_extract_median <- test3$var
+
+names(zonal_sd) <- c(names(zonal_sd[1:5]), paste0(names(zonal_sd[6:105]), "_sd"))
+
+zonal_extract <- left_join(zonal_means, zonal_medians)
+zonal_extract <- left_join(zonal_extract, zonal_sd)
+
+zonal_extract$idtxt <- NULL
+zonal_extract$OBJECTID <- NULL
+zonal_extract$Shape_Area <- NULL
+zonal_extract$Shape_Length <- NULL
+zonal_extract$train0_test1 <- 0
+zonal_extract$X.1 <- 0
+
+# #create a lookup table to translate between zonal_extract names and original names 
+# test2 <- sort(names(myfiles2))
+# test3 <- sort(names(zonal_extract))
+# writeClipboard(test3)
+
+#rename column names to match what the original names were
+name_vectors <- read.csv("E:/tree_classification/predictions/sjb_rast_extraction/name_match_table190610.csv",
+                         stringsAsFactors = FALSE)
+names(zonal_extract) = name_vectors$names_orig[match(names(zonal_extract), name_vectors$names_sjb)]
+
+##make sure that the names line up between zonal_extract and the originally used dataset
+#intersect(test2, test3)
+#names(myfiles2)[names(myfiles2) %in% names(test) == FALSE]
+#names(t4)[names(t4) %in% names(myfiles2) == FALSE]
+
+
+#predict myfiles2 tree identity
+#myfiles2$train0_test1 <- 0
+#predValid <- predict(model1, ValidSet, type = "class")
+preds <- as.data.frame(predict(model1, zonal_extract, type = "class"))
+#test <- as.data.frame(predict(model1, myfiles2, type = "class"))
+names(preds) <- "predicted_taxon"
+preds2 <- bind_cols(zonal_extract, preds)
+preds3 <- dplyr::select(preds2, grdcd, Id, predicted_taxon)
+preds4 <- left_join(preds3, all_t_seg) #the join converts it to a tibble
+preds5 <- st_as_sf(preds4) #explicitly turning it back into an sf
+
+#setwd("")
+write_sf(preds5, "D:/tree_classification/predictions/pred190715.shp")
+
+summary(preds5$predicted_taxon)
+#
+preds_sub <- dplyr::filter(preds5, predicted_taxon == "Acer_platanoides") %>% dplyr::select(predicted_taxon)
+#preds_sub <- preds5[1:10000,3]
+preds_sub_small <- st_crop(preds5, c(xmin= 321234, xmax= 321534, ymin= 4691234, ymax= 4691534)) %>% 
+  dplyr::select(predicted_taxon)
+
+plot(preds_sub_small, border = "gray")
+
+
+#merged the predictions with street tree data, double check the accuracy now
+#read in shapefile
+tree_pred <- st_read("D:/tree_classification/predictions/pred190715_joinedstreettrees.shp")
+names(tree_pred)
+tree_pred$prdctd_[1:100]
+unique(tree_pred$genus[1:100])
+#compare accuracy
+
+# ## tree pollen production equations plug in
+# test2 <- tree_pred %>% dplyr::select(prdctd_, SPP, genus, DBH, nSDM_2017_) %>% filter(genus != "<NA>")
+# test2$area <- st_area(test2)
+# test2$area[test2$prdctd == "Acer_platanoides" & !is.na(test2$prdctd)]
+# test2$area <- as.numeric(test2$area)
+# test2$predpollen <- NA
+# 
+# test2$predpollen[test2$prdctd == "Quercus" & !is.na(test2$prdctd)] <- 
+#   test2$area[test2$prdctd == "Quercus" & !is.na(test2$prdctd)] * 0.22 + 3.93  
+# 
+# test2$predpollen[test2$prdctd == "Gleditsia" & !is.na(test2$prdctd)] <- 
+#   test2$area[test2$prdctd == "Gleditsia" & !is.na(test2$prdctd)] * 0.46 -3.18  
+# 
+# test2$predpollen[test2$prdctd == "Platanus" & !is.na(test2$prdctd)] <- 
+#   test2$area[test2$prdctd == "Platanus" & !is.na(test2$prdctd)] * 0.07 - 1.04
+# 
+# p_Acpl <- filter(tree_pred, prdctd_ == "Acer_platanoides" & !is.na(prdctd_)) %>% 
+#   dplyr::select(area, predpollen)
+# p_Acpl$predpollen <- p_Acpl$area * 0.05 + 0.61  
+# 
+# 
+# d_rast <- raster(ncol = 50, nrow = 50)
+# extent(d_rast) <- extent(test)
+# #a2_small_extent <- extent(c(13280000, 13280000 + 30000, 265242.3,  300536.3))
+# #a2_rast <- crop(a2_rast, a2_small_extent)
+# test <- rasterize(p_Acpl, d_rast, field = "predpollen", fun = sum)
+# pixel_area <- (res(test)[1] * res(test)[2]) #get pixel area in m2
+# test <- (test/ pixel_area) * 1000000 #convert to pol/m2 (was originally in millions)
+# test[test < 0] <- 0 #make sure that none of the trees have values below 0
+# #plot(test)
+# 
+# 
+# write_sf(p_Acpl, "D:/tree_classification/predictions/p_acpl190806.shp")
+# sf_write
+# plot(p_Acpl)
+# 
+# 
+# names(test2)
+# hist(test2$predpollen)
+# 
+# #predicted pollen surface 
+# 
+# 
+# test2$geometry <- NULL
+# test2$genus_st <- as.character(test2$genus)
+# test2$genus_st[test2$SPP == "Acer platanoides"] <- "Acer_platanoides"
+# test3 <- dplyr::select(test2, prdctd_, genus_st)
+# test4 <- as.data.frame(table(test3))
+
+#mean(predValid == ValidSet$taxa) 
+confusion_df <- as.data.frame.matrix(table(test3$prdctd_, test3$genus_st)) #rows = predicted, col = actual
+confusion_df$row_sum <- rowSums(confusion_df)
+confusion_df[ (nrow(confusion_df) +1) ,] <- colSums(confusion_df)
+
+ggplot(test2, aes(x = prdctd_, y = genus_st)) + geom_point()
+
+#names(ValidSet)
+#names(myfiles2)
+#names(myfiles2)[names(myfiles2) %in% names(ValidSet) == FALSE]
+
+#convert back to a shapefile
+
+
+#convert objects to raster
+
+#assemble raster tiles into raster mosaic for all of D
+
+
+
+
+### stats for predictions across Detroit ########################################
+library(sf)
+# read in predictions 
+tree_pred <- st_read("C:/Users/dsk856/Box/MIpostdoc/trees/tree_identificaiton/predictions/pred190715.shp")
+tree_pred$area <- st_area(tree_pred)
+tree_pred_nogeo <- tree_pred
+tree_pred_nogeo$geometry <- NULL
+
+tree_pred %>% filter(is.na(prdctd_)) %>% plot()
+
+
+Table5 <- tree_pred_nogeo %>% group_by(prdctd_) %>%
+  summarize(n_trees = n(),
+            area_sum = round(sum(area), 0)) %>% 
+  arrange(-n_trees)
+
+tree_pred_total_n_trees <- sum(Table5$n_trees)
+tree_pred_total_area <- sum(Table5$area_sum)
+Table5 %>% mutate()
